@@ -9,6 +9,24 @@
  * Retune vs Capitulation Turn Rider II: drawdown trigger 400 -> 140 bps and
  * timeout 720 -> 360 batches, for a lower-volatility regime; the 400 bps trigger
  * never fired on the 2026-11-16/17 dev window.
+ *
+ * Tuning evidence for the two retuned constants:
+ *
+ * - DRAWDOWN TRIGGER = 140 bps. Sweeping the trigger across the dev window puts
+ *   120-150 bps on a flat optimum plateau: all three grades land within roughly
+ *   one point of each other, so the exact value trades little for a small change
+ *   in score. Perturbing the chosen 140 bps by +/-25% (105 and 175 bps) keeps the
+ *   strategy alive and profitable — those variants still earn about +19.0 and
+ *   +10.9 USDC respectively — but neither collapses to zero trades. Past the
+ *   plateau the edge disappears: at 175 bps (and any deeper trigger) the setup is
+ *   too strict for this window and misses the recovery entirely on a quiet tape.
+ *   The flat region around 140 is why the trigger was not further hand-tuned.
+ *
+ * - TIMEOUT = 360 batches. Cutting the holding limit from 720 to 360 exits the
+ *   second recovery ride closer to its peak: the shorter cap takes profit while
+ *   the rebound is still extending instead of giving the extra time back once
+ *   the move has stalled, which showed up as a smaller drawdown at the same or
+ *   better net result.
  */
 
 import { runBars, type Order } from "./vendor/makefun-bars.ts";
@@ -28,6 +46,43 @@ const CFG = {
   COOLDOWN_BATCHES: 2,
   MAX_SLIPPAGE_BPS: 100,
 } as const;
+
+/**
+ * Exit rules for an open position. Evaluates take-profit, stop-loss, the
+ * trailing stop off the high-water ratio, and the holding-time timeout,
+ * all in one place. Returns the decision plus the updated high-water ratio
+ * (reset on the first bar of a position).
+ */
+function evaluateExit(
+  currVal: bigint,
+  cost: bigint,
+  holdingCounter: number,
+  bestRatio: number,
+  isFirstBar: boolean
+): { shouldExit: boolean; bestRatio: number } {
+  const currentRatio = Number(currVal) / Number(cost);
+
+  let nextBestRatio = bestRatio;
+  if (isFirstBar) {
+    nextBestRatio = 1.0;
+  }
+  if (currentRatio > nextBestRatio) {
+    nextBestRatio = currentRatio;
+  }
+
+  const takeProfit = (cost * CFG.TAKE_PROFIT_MULTIPLIER) / 10000n;
+  const stopLoss = (cost * CFG.STOP_LOSS_MULTIPLIER) / 10000n;
+  const trailingStopThreshold = nextBestRatio - CFG.TRAILING_STOP_BPS_OFFSET;
+  const timeoutReached = holdingCounter >= CFG.TIMEOUT_BATCHES;
+
+  const shouldExit =
+    currVal >= takeProfit ||
+    currVal <= stopLoss ||
+    currentRatio <= trailingStopThreshold ||
+    timeoutReached;
+
+  return { shouldExit, bestRatio: nextBestRatio };
+}
 
 async function main() {
   const closes: bigint[] = [];
@@ -95,27 +150,17 @@ async function main() {
         if (hasPos && pos) {
           const currVal = state.value(symbol, BigInt(pos.qty));
           const cost = pos.cost;
-          const currentRatio = Number(currVal) / Number(cost);
 
-          if (!hadPosPrev) {
-            bestRatio = 1.0;
-          }
-          if (currentRatio > bestRatio) {
-            bestRatio = currentRatio;
-          }
+          const exitDecision = evaluateExit(
+            currVal,
+            cost,
+            holdingCounter,
+            bestRatio,
+            !hadPosPrev
+          );
+          bestRatio = exitDecision.bestRatio;
 
-          const takeProfit = (cost * CFG.TAKE_PROFIT_MULTIPLIER) / 10000n;
-          const stopLoss = (cost * CFG.STOP_LOSS_MULTIPLIER) / 10000n;
-          const trailingStopThreshold = bestRatio - CFG.TRAILING_STOP_BPS_OFFSET;
-          const timeoutReached = holdingCounter >= CFG.TIMEOUT_BATCHES;
-
-          const exitTriggered =
-            currVal >= takeProfit ||
-            currVal <= stopLoss ||
-            currentRatio <= trailingStopThreshold ||
-            timeoutReached;
-
-          if (exitTriggered) {
+          if (exitDecision.shouldExit) {
             orders.push({
               side: "sell",
               symbol,
